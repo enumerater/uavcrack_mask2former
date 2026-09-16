@@ -59,6 +59,10 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
+    # 实测: batch 2 显存峰值 3.4G / 吞吐 3.8 张每秒
+    #       batch 4 显存峰值 5.9G / 吞吐 5.1 张每秒
+    # 选 2 是为了留足余量 —— 本机微信等程序常驻占用约 1G, batch 4 跑几小时
+    # 中途容易被挤爆。想提速可以改成 4, 但要做好随时可能 OOM 的心理准备。
     batch_size=2,
     # Windows 的 DataLoader worker 走 spawn, 开大了启动和内存都吃不消
     num_workers=2,
@@ -258,8 +262,10 @@ model = dict(
 # --------------------------------------------------------------- 优化器 ----
 # 单卡 batch=2, 用梯度累积堆到等效 batch 16, 这样可以直接沿用官方 lr=1e-4。
 # 若嫌慢, 把 accumulative_counts 降到 4 并把 lr 改成 5e-5。
+# 官方 lr=1e-4 对应等效 batch 16。这里等效 batch 只有 8
+# (batch_size 2 x accumulative_counts 4), 按比例折半取 5e-5。
 optimizer = dict(
-    type='AdamW', lr=0.0001, weight_decay=0.05, eps=1e-8, betas=(0.9, 0.999))
+    type='AdamW', lr=0.00005, weight_decay=0.05, eps=1e-8, betas=(0.9, 0.999))
 
 embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
 backbone_norm_multi = dict(lr_mult=0.1, decay_mult=0.0)
@@ -285,17 +291,39 @@ custom_keys.update({
     for stage_id in range(3)
 })
 
-optim_wrapper = dict(
-    type='AmpOptimWrapper',
-    dtype='float16',
+# 精度选择。实测结论:
+#   None       -> 纯 fp32。mask2former 在 384x672 / batch 2 下只占约 2.3G 显存,
+#                 8G 完全放得下, 那就没必要冒混合精度的风险。
+#   'bfloat16' -> 与 fp32 同指数范围, 不会像 fp16 那样溢出; 想提速可以试, 但
+#                 需要先确认 mmcv 的 CUDA 算子支持 bf16。
+#   'float16'  -> 【不要用】实测在 Hungarian 匹配阶段代价矩阵出 NaN,
+#                 报错 "cost matrix is infeasible", 训练直接崩。
+AMP_DTYPE = None
+
+_optim_wrapper = dict(
     optimizer=optimizer,
-    accumulative_counts=8,
+    # 注意: mmengine 的 IterBasedTrainLoop 里 max_iters 数的是 micro-batch,
+    # 不是优化步数。一个 train_step 只做一次前向反向, 梯度攒够
+    # accumulative_counts 次才 step 一次优化器。
+    accumulative_counts=4,
     # Mask2Former 对梯度爆炸很敏感, 官方就用了 0.01 的强裁剪
     clip_grad=dict(max_norm=0.01, norm_type=2),
     paramwise_cfg=dict(custom_keys=custom_keys, norm_decay_mult=0.0),
 )
+if AMP_DTYPE is None:
+    optim_wrapper = dict(type='OptimWrapper', **_optim_wrapper)
+else:
+    optim_wrapper = dict(
+        type='AmpOptimWrapper', dtype=AMP_DTYPE, **_optim_wrapper)
 
-MAX_ITERS = 20000
+# 训练总量, 单位是 micro-batch (见上面的说明)。
+#   等效 batch = batch_size * accumulative_counts = 2 * 4 = 8
+#   优化步数   = MAX_ITERS / accumulative_counts = 30000 / 4 = 7500
+#   训练规模   = MAX_ITERS * batch_size = 60000 张图, 979 张一轮 -> 约 61 轮
+#   预计耗时   = 30000 * 0.53s ≈ 4.4 小时
+# 有 save_best + 每 1000 iter 存 checkpoint, 中途觉得够了随时 Ctrl+C,
+# 之后用 tools/ 里的脚本挑 best_Crack_F1_*.pth 出结果即可。
+MAX_ITERS = 30000
 param_scheduler = [
     dict(
         type='PolyLR',
@@ -306,8 +334,10 @@ param_scheduler = [
         by_epoch=False)
 ]
 
+# val_interval 同样是 micro-batch 单位。1000 iter ≈ 8.8 分钟验证一次,
+# 每次验证 221 张约 20 秒, 开销约 4%。
 train_cfg = dict(
-    type='IterBasedTrainLoop', max_iters=MAX_ITERS, val_interval=500)
+    type='IterBasedTrainLoop', max_iters=MAX_ITERS, val_interval=1000)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
@@ -333,7 +363,7 @@ default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
         by_epoch=False,
-        interval=500,
+        interval=1000,          # 与 val_interval 对齐
         save_best='Crack_F1',   # 直接盯比赛真正打分的指标
         rule='greater',
         max_keep_ckpts=3,

@@ -14,9 +14,10 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+from mmengine.dist import is_main_process
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger, print_log
-from mmengine.utils import is_main_process, mkdir_or_exist
+from mmengine.utils import mkdir_or_exist
 from PIL import Image
 
 from mmseg.registry import METRICS
