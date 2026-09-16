@@ -8,7 +8,7 @@
 之后用 tools/make_submission.py 打包即可 (本脚本也可以直接 --zip 一步到位)。
 
 用法:
-    # 用 best 权重推理
+    # 用 best 权重推理官方 300 张
     python tools/infer_submit.py \
         --config configs/uavcrack_mask2former_swin-t.py \
         --checkpoint work_dirs/uavcrack_mask2former_swin-t/best_Crack_F1_iter_XXXXX.pth
@@ -18,6 +18,11 @@
 
     # 想调分割阈值 (默认 0.5), mask 概率大于该值判为裂缝
     python tools/infer_submit.py -c ... -k ... --thr 0.4
+
+    # 在本地验证集上复评某个权重, 再交给 eval_metrics.py 核对
+    python tools/infer_submit.py -c ... -k ... \
+        --split-file splits/val.txt --out-dir val_pred
+    python tools/eval_metrics.py --pred-dir val_pred --split-file splits/val_pairs.txt
 """
 import argparse
 import os
@@ -40,7 +45,17 @@ def parse_args():
     ap.add_argument(
         '--img-dir',
         default='UAV-Crack-dataset/leftImg8bit/val',
-        help='待推理图片目录 (官方 300 张)')
+        help='待推理图片目录 (官方 300 张)。给了 --split-file 时忽略此项')
+    ap.add_argument(
+        '--split-file',
+        default=None,
+        help='本地验证集清单 (如 splits/val.txt)。给了它就在本地 val 上推理, '
+        '配合 tools/eval_metrics.py 复评权重')
+    ap.add_argument(
+        '--data-root',
+        default='UAV-Crack-dataset/leftImg8bit/train',
+        help='--split-file 模式下的图片根目录')
+    ap.add_argument('--img-suffix', default='.jpg', help='--split-file 模式下的图片后缀')
     ap.add_argument('--out-dir', default='test_pred', help='预测 mask 输出目录')
     ap.add_argument(
         '--thr',
@@ -94,11 +109,33 @@ def main():
     cfg, model = build_model(args.config, args.checkpoint, args.device)
     pipeline = build_pipeline(cfg)
 
-    files = sorted(
-        f for f in os.listdir(args.img_dir)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png')))
-    if not files:
-        raise SystemExit(f'[FATAL] 图片目录为空: {args.img_dir}')
+    # 两种输入模式:
+    #   官方提交  -> --img-dir 平铺目录, 文件名原样保留
+    #   本地复评  -> --split-file 清单, 路径由 data_root + 清单行拼出
+    if args.split_file:
+        with open(args.split_file, encoding='utf-8') as f:
+            stems = [
+                line.strip().split()[0] for line in f if line.strip()
+            ]
+        if not stems:
+            raise SystemExit(f'[FATAL] 清单为空: {args.split_file}')
+        sources = []
+        for stem in stems:
+            p = osp.join(args.data_root, stem + args.img_suffix)
+            if not osp.exists(p):
+                raise SystemExit(f'[FATAL] 清单里的图片不存在: {p}')
+            sources.append((osp.basename(stem), p))
+        src_desc = f'{args.split_file}  ({len(sources)} 条)'
+    else:
+        names = sorted(
+            f for f in os.listdir(args.img_dir)
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')))
+        if not names:
+            raise SystemExit(f'[FATAL] 图片目录为空: {args.img_dir}')
+        sources = [
+            (osp.splitext(f)[0], osp.join(args.img_dir, f)) for f in names
+        ]
+        src_desc = f'{args.img_dir}  ({len(sources)} 张)'
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -106,7 +143,7 @@ def main():
     print('UAV-Crack 推理')
     print('=' * 70)
     print(f'  权重     : {args.checkpoint}')
-    print(f'  输入     : {args.img_dir}  ({len(files)} 张)')
+    print(f'  输入     : {src_desc}')
     print(f'  输出     : {args.out_dir}')
     print(f'  阈值     : {args.thr}')
     print(f'  设备     : {args.device}')
@@ -116,8 +153,7 @@ def main():
     all_zero = 0
     shape_bad = []
 
-    for i, name in enumerate(files, 1):
-        path = osp.join(args.img_dir, name)
+    for i, (stem, path) in enumerate(sources, 1):
         data = pipeline(dict(img_path=path))
         data_samples = [data['data_samples']]
         # EncoderDecoder.predict 不会自己调 data_preprocessor, 得手动走一遍
@@ -146,20 +182,24 @@ def main():
         if mask.sum() == 0:
             all_zero += 1
 
-        stem = osp.splitext(name)[0]
         Image.fromarray(mask).save(osp.join(args.out_dir, f'{stem}.png'))
 
-        if i % 50 == 0 or i == len(files):
-            print(f'  [{i}/{len(files)}]  平均裂缝占比 {crack_ratio_sum / i:.2%}')
+        if i % 50 == 0 or i == len(sources):
+            print(f'  [{i}/{len(sources)}]  平均裂缝占比 {crack_ratio_sum / i:.2%}')
 
     print('-' * 70)
-    print(f'  平均预测裂缝占比 : {crack_ratio_sum / len(files):.2%}')
-    print(f'  参考: 训练集真值裂缝占比约 6.2%')
+    print(f'  平均预测裂缝占比 : {crack_ratio_sum / len(sources):.2%}')
+    print('  参考: 训练集真值裂缝占比约 6.2%, 越接近说明尺度越对')
     if all_zero:
         print(f'  [WARN] 有 {all_zero} 张预测为全背景 (无裂缝)')
     if shape_bad:
         print(f'  [ERROR] {len(shape_bad)} 张尺寸不对: {shape_bad[:3]}')
     print('=' * 70)
+
+    if args.zip and args.split_file:
+        raise SystemExit(
+            '[FATAL] --zip 只能用于官方 300 张 val。本地验证集请改用 '
+            'tools/eval_metrics.py 对比真值。')
 
     if args.zip:
         cmd = (f'"{sys.executable}" tools/make_submission.py '
