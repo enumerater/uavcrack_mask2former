@@ -163,6 +163,13 @@ def main():
             training=False)
         inputs = pre['inputs'].to(args.device)
 
+        # 必须用 preprocessor 返回的 data_samples, 不能用传进去的那份。
+        # cast_data 会把 BaseDataElement .to(device) 成**新对象**, padding 信息
+        # (img_padding_size) 只写在新对象上。拿旧对象去 predict, postprocess_result
+        # 读不到 padding, 就不会裁掉底部补的 6 行, 而是把 384 行的 logits 双线性
+        # 压成 378 行 —— 整张预测被垂直拉伸, F1 会掉十几个点。
+        data_samples = pre['data_samples']
+
         ori_hw = tuple(data_samples[0].metainfo['ori_shape'][:2])
         pred = model.predict(inputs, data_samples)
         logits = pred[0].pred_sem_seg.data  # (H, W)
@@ -175,7 +182,7 @@ def main():
 
         mask = (logits > 0).to(torch.uint8).cpu().numpy()
         if mask.shape != ori_hw:
-            shape_bad.append((name, mask.shape, ori_hw))
+            shape_bad.append((stem, mask.shape, ori_hw))
 
         ratio = float(mask.mean())
         crack_ratio_sum += ratio

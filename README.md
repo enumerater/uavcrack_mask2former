@@ -231,9 +231,7 @@ work_dirs/uavcrack_mask2former_swin-t/
 或者提交前最后确认一次：
 
 ```bat
-python tools/infer_submit.py -c configs/uavcrack_mask2former_swin-t.py ^
-    -k work_dirs/uavcrack_mask2former_swin-t/best_Crack_F1_iter_12000.pth ^
-    --split-file splits/val.txt --out-dir val_pred
+python tools/infer_submit.py -c configs/uavcrack_mask2former_swin-t.py -k work_dirs/uavcrack_mask2former_swin-t/best_Crack_F1_iter_11000.pth --split-file splits/val.txt --out-dir val_pred
 
 python tools/eval_metrics.py --pred-dir val_pred --split-file splits/val_pairs.txt --check-size
 ```
@@ -250,9 +248,7 @@ eval_metrics Crack F1: 0.4123     ← 对不上就说明有一边口径有问题
 ### 5. 生成提交
 
 ```bat
-python tools/infer_submit.py -c configs/uavcrack_mask2former_swin-t.py ^
-    -k work_dirs/uavcrack_mask2former_swin-t/best_Crack_F1_iter_12000.pth ^
-    --out-dir test_pred --zip
+python tools/infer_submit.py -c configs/uavcrack_mask2former_swin-t.py -k work_dirs/uavcrack_mask2former_swin-t/best_Crack_F1_iter_11000.pth --out-dir test_pred --zip
 ```
 
 `--zip` 会顺带调 `make_submission.py`，自动校验 300 张、分辨率、像素值 0/1、
